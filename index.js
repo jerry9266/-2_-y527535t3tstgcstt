@@ -4,201 +4,409 @@ const { chromium } = require("playwright");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const SOURCE_URL = "https://downloadwella.com/u8yg9cg1fnti";
+const SOURCE_URL =
+    "https://downloadwella.com/u8yg9cg1fnti";
 
 app.use(express.json());
 
 let browser;
+let context;
 let page;
 let busy = false;
-let state = "loading";
-let downloadUrl = null;
+let currentState = "idle";
+let lastDownloadUrl = null;
 
-async function initialize() {
-    browser = await chromium.launch({ headless: true });
+function setState(state) {
+    currentState = state;
+}
 
-    const context = await browser.newContext({
+async function initializeBrowser() {
+    browser = await chromium.launch({
+        headless: true
+    });
+
+    context = await browser.newContext({
         acceptDownloads: true
     });
 
     page = await context.newPage();
 
+    page.setDefaultTimeout(20000);
+
     await page.goto(SOURCE_URL, {
         waitUntil: "domcontentloaded",
-        timeout: 60000
+        timeout: 45000
     });
 
-    state = "create";
+    console.log("Browser opened:", SOURCE_URL);
 }
 
-async function findButton(name) {
-    const controls = page.locator(
-        "button, a, [role='button'], input[type='button'], input[type='submit']"
+function findButton(text) {
+    return page.getByText(text, {
+        exact: false
+    }).filter({
+        visible: true
+    }).first();
+}
+
+async function findVisibleControl(pattern) {
+    const candidates = page.locator(
+        "a, button, input[type='button'], input[type='submit'], [role='button']"
     );
 
-    for (let i = 0; i < await controls.count(); i++) {
-        const el = controls.nth(i);
+    const count = await candidates.count();
 
-        if (!(await el.isVisible().catch(() => false))) continue;
+    for (let i = 0; i < count; i++) {
+        const element = candidates.nth(i);
 
-        const text = (
-            await el.innerText().catch(() => "")
-        ).trim() || await el.getAttribute("value") || "";
+        if (!(await element.isVisible())) {
+            continue;
+        }
 
-        if (new RegExp(name, "i").test(text)) {
-            return el;
+        const label = (
+            await element.innerText().catch(() => "")
+        ).trim();
+
+        const value = await element.getAttribute("value")
+            .catch(() => "");
+
+        const text = label || value || "";
+
+        if (pattern.test(text)) {
+            return element;
         }
     }
 
     return null;
 }
 
-async function inspectState() {
-    if (await findButton("^start download$")) {
-        state = "start";
-    } else if (await findButton("^create download link$")) {
-        state = "create";
-    } else if (await findButton("^create download$")) {
-        state = "create";
+async function getLinkFromControl(control) {
+    if (!control) {
+        return null;
     }
 
-    return state;
+    const tag = await control.evaluate(
+        element => element.tagName.toLowerCase()
+    );
+
+    if (tag === "a") {
+        const href = await control.getAttribute("href");
+
+        if (href) {
+            return new URL(href, page.url()).href;
+        }
+    }
+
+    const nestedLink = control.locator("a[href]").first();
+
+    if (await nestedLink.count()) {
+        const href = await nestedLink.getAttribute("href");
+
+        if (href) {
+            return new URL(href, page.url()).href;
+        }
+    }
+
+    return null;
 }
 
+// Frontend
 app.get("/", (req, res) => {
     res.type("html").send(`
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Download Controller</title>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
+
+<title>Download Link Controller</title>
+
 <style>
+* {
+    box-sizing: border-box;
+}
+
 body {
     margin: 0;
-    padding: 25px;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 20px;
     background: #0b0b10;
     color: white;
     font-family: Arial, sans-serif;
 }
-main {
-    max-width: 420px;
-    margin: 60px auto;
-    padding: 22px;
-    border-radius: 15px;
+
+.card {
+    width: 100%;
+    max-width: 440px;
+    padding: 24px;
+    border-radius: 16px;
     background: #191921;
 }
+
+h1 {
+    font-size: 23px;
+}
+
+p {
+    color: #b6b6c2;
+    line-height: 1.6;
+}
+
 button {
     width: 100%;
-    padding: 15px;
-    margin: 10px 0;
+    padding: 14px;
+    margin-top: 12px;
     border: 0;
-    border-radius: 9px;
+    border-radius: 8px;
     background: #ff5216;
     color: white;
-    font-size: 16px;
+    font-size: 15px;
     font-weight: bold;
+    cursor: pointer;
 }
-#result {
+
+button:disabled {
+    opacity: 0.5;
+}
+
+#startButton, #result {
+    display: none;
+}
+
+#startButton.visible, #result.visible {
+    display: block;
+}
+
+.output {
     overflow-wrap: anywhere;
+    padding: 12px;
+    border: 1px solid #40404b;
+    border-radius: 8px;
+    background: #0b0b10;
     color: #8bffb0;
+}
+
+#status {
+    margin-top: 16px;
+    font-size: 14px;
+    overflow-wrap: anywhere;
 }
 </style>
 </head>
+
 <body>
-<main>
-    <h2>Download</h2>
-    <button id="action" onclick="clickAction()" disabled>
-        Loading...
+<main class="card">
+    <h1>Download Link Controller</h1>
+
+    <p>
+        Control the browser session and retrieve the
+        resulting download URL.
+    </p>
+
+    <button id="createButton" onclick="createDownload()">
+        Create Download
     </button>
-    <p id="status">Connecting to browser...</p>
-    <p id="result"></p>
+
+    <button id="startButton" onclick="startDownload()">
+        Start Download
+    </button>
+
+    <section id="result">
+        <p>Download URL:</p>
+        <div class="output" id="downloadUrl"></div>
+
+        <button onclick="copyUrl()">Copy Download URL</button>
+        <button onclick="openUrl()">Open Download URL</button>
+    </section>
+
+    <div id="status">Ready.</div>
 </main>
 
 <script>
-const action = document.getElementById("action");
-const status = document.getElementById("status");
-const result = document.getElementById("result");
+const statusElement = document.getElementById("status");
+const createButton = document.getElementById("createButton");
+const startButton = document.getElementById("startButton");
+const resultElement = document.getElementById("result");
 
-async function refresh() {
-    try {
-        const response = await fetch("/api/state");
-        const data = await response.json();
+let downloadUrl = "";
 
-        action.disabled = !data.ready || data.busy;
+async function request(path) {
+    const response = await fetch(path, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({})
+    });
 
-        if (data.state === "create") {
-            action.textContent = "Create Download";
-        } else if (data.state === "start") {
-            action.textContent = "Start Download";
-        } else {
-            action.textContent = "Please wait...";
-            action.disabled = true;
-        }
+    const data = await response.json();
 
-        status.textContent = data.message || "Ready";
-
-        if (data.downloadUrl) {
-            result.textContent = data.downloadUrl;
-        }
-    } catch {
-        status.textContent = "Server connection failed.";
+    if (!response.ok) {
+        throw new Error(data.error || "Request failed.");
     }
+
+    return data;
 }
 
-async function clickAction() {
-    action.disabled = true;
-    status.textContent = "Processing...";
+async function createDownload() {
+    createButton.disabled = true;
+    statusElement.textContent =
+        "Server is clicking Create Download...";
 
     try {
-        const response = await fetch("/api/click", {
-            method: "POST"
-        });
+        const data = await request("/api/create-download");
 
-        const data = await response.json();
+        statusElement.textContent = data.message;
 
-        if (!response.ok) throw new Error(data.error);
-
-        status.textContent = data.message || "Updated";
-        if (data.downloadUrl) {
-            result.textContent = data.downloadUrl;
+        if (data.state === "start-ready") {
+            startButton.classList.add("visible");
         }
     } catch (error) {
-        status.textContent = error.message || "Action failed";
+        statusElement.textContent = error.message;
+    } finally {
+        createButton.disabled = false;
     }
-
-    await refresh();
 }
 
-refresh();
-setInterval(refresh, 1500);
+async function startDownload() {
+    startButton.disabled = true;
+    statusElement.textContent =
+        "Server is processing Start Download...";
+
+    try {
+        const data = await request("/api/start-download");
+
+        if (data.downloadUrl) {
+            downloadUrl = data.downloadUrl;
+
+            document.getElementById("downloadUrl").textContent =
+                downloadUrl;
+
+            resultElement.classList.add("visible");
+
+            statusElement.textContent =
+                "Download URL retrieved.";
+        } else {
+            statusElement.textContent =
+                data.message || "No download URL was detected.";
+        }
+    } catch (error) {
+        statusElement.textContent = error.message;
+    } finally {
+        startButton.disabled = false;
+    }
+}
+
+async function copyUrl() {
+    if (!downloadUrl) return;
+
+    try {
+        await navigator.clipboard.writeText(downloadUrl);
+        statusElement.textContent = "URL copied.";
+    } catch (_) {
+        statusElement.textContent =
+            "Clipboard unavailable. Copy the displayed URL manually.";
+    }
+}
+
+function openUrl() {
+    if (downloadUrl) {
+        window.open(downloadUrl, "_blank");
+    }
+}
 </script>
 </body>
 </html>
-`);
+    `);
 });
 
-app.get("/api/state", async (req, res) => {
-    if (page && !page.isClosed() && !busy) {
-        await inspectState().catch(() => {});
-    }
-
-    res.json({
-        ready: !!page && !page.isClosed(),
-        busy,
-        state,
-        downloadUrl,
-        message: state === "start"
-            ? "Start Download is ready."
-            : state === "create"
-                ? "Create Download is ready."
-                : "Waiting for the browser."
-    });
-});
-
-app.post("/api/click", async (req, res) => {
+// Step 1: Click Create download link.
+app.post("/api/create-download", async (req, res) => {
     if (busy) {
         return res.status(409).json({
-            error: "An action is already running."
+            error: "Another browser action is in progress."
+        });
+    }
+
+    busy = true;
+
+    try {
+        if (!page || page.isClosed()) {
+            await initializeBrowser();
+        }
+
+        const control = await findVisibleControl(
+            /create\s+download\s+link/i
+        );
+
+        if (!control) {
+            return res.status(404).json({
+                error: "Create download link button was not found."
+            });
+        }
+
+        await control.click();
+
+        // Wait for the page to expose the next action.
+        await page.waitForFunction(() => {
+            const elements = Array.from(
+                document.querySelectorAll(
+                    "a, button, input, [role='button']"
+                )
+            );
+
+            return elements.some(element => {
+                const text = (
+                    element.innerText ||
+                    element.value ||
+                    ""
+                ).trim();
+
+                return /start\s+download/i.test(text) &&
+                    element.getClientRects().length > 0;
+            });
+        }, { timeout: 20000 }).catch(() => {});
+
+        const startControl = await findVisibleControl(
+            /start\s+download/i
+        );
+
+        if (!startControl) {
+            setState("create-clicked");
+
+            return res.json({
+                success: true,
+                state: currentState,
+                message:
+                    "Create action completed, but Start Download was not detected."
+            });
+        }
+
+        setState("start-ready");
+
+        res.json({
+            success: true,
+            state: currentState,
+            message: "Start Download is ready."
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            error: error.message
+        });
+    } finally {
+        busy = false;
+    }
+});
+
+// Step 2: Click Start Download and capture a download URL.
+app.post("/api/start-download", async (req, res) => {
+    if (busy) {
+        return res.status(409).json({
+            error: "Another browser action is in progress."
         });
     }
 
@@ -209,139 +417,110 @@ app.post("/api/click", async (req, res) => {
             throw new Error("Browser session is unavailable.");
         }
 
-        await inspectState();
-
-        const expectedName = state === "create"
-            ? /create download(?: link)?/i
-            : /start download/i;
-
-        const control = await findButton(expectedName.source);
+        const control = await findVisibleControl(
+            /start\s+download/i
+        );
 
         if (!control) {
             throw new Error(
-                "The expected button was not found on the source page."
+                "Start Download button was not found."
             );
         }
 
-        // If Start Download is a link, capture its actual destination.
-        if (state === "start") {
-            const tag = await control.evaluate(
-                el => el.tagName.toLowerCase()
-            );
+        let capturedUrl = await getLinkFromControl(control);
 
-            let href = tag === "a"
-                ? await control.getAttribute("href")
-                : null;
-
-            if (!href) {
-                href = await control.locator("a[href]")
-                    .first()
-                    .getAttribute("href")
-                    .catch(() => null);
-            }
-
-            if (href) {
-                downloadUrl = new URL(href, page.url()).href;
-
-                return res.json({
-                    success: true,
-                    state,
-                    downloadUrl,
-                    message: "Download link captured."
-                });
-            }
-        }
-
-        const beforeUrl = page.url();
-
-        const downloadPromise = page.waitForEvent("download", {
-            timeout: 15000
-        }).catch(() => null);
-
-        const responsePromise = page.waitForResponse(response =>
-            /attachment/i.test(
-                response.headers()["content-disposition"] || ""
-            )
-        , { timeout: 15000 }).catch(() => null);
-
-        await control.click();
-
-        if (state === "create") {
-            await page.waitForFunction(() =>
-                [...document.querySelectorAll(
-                    "button, a, [role='button'], input"
-                )].some(el =>
-                    el.getClientRects().length &&
-                    /start download/i.test(
-                        (el.innerText || el.value || "").trim()
-                    )
-                ), { timeout: 20000 }
-            ).catch(() => {});
-
-            await inspectState();
-
-            if (state !== "start") {
-                state = "waiting";
-            }
+        // If the control contains an actual link, return it.
+        if (capturedUrl) {
+            lastDownloadUrl = capturedUrl;
 
             return res.json({
                 success: true,
-                state,
-                message: state === "start"
-                    ? "Start Download is ready."
-                    : "The page has not exposed Start Download yet."
+                downloadUrl: capturedUrl,
+                source: "link-element"
             });
         }
 
-        const [download, downloadResponse] = await Promise.all([
-            downloadPromise,
-            responsePromise
-        ]);
+        // Otherwise, observe the download event while clicking.
+        const downloadPromise = page.waitForEvent("download", {
+            timeout: 20000
+        }).catch(() => null);
 
-        if (downloadResponse) {
-            downloadUrl = downloadResponse.url();
+        const responsePromise = page.waitForResponse(response => {
+            const headers = response.headers();
+
+            return (
+                headers["content-disposition"] &&
+                /attachment/i.test(headers["content-disposition"])
+            );
+        }, {
+            timeout: 20000
+        }).catch(() => null);
+
+        await control.click();
+
+        const download = await downloadPromise;
+
+        if (download) {
+            capturedUrl = download.url();
         }
 
-        // A download event does not itself expose the source URL.
-        // Inspect browser requests if the response URL wasn't captured.
-        if (!downloadUrl && page.url() !== beforeUrl) {
-            downloadUrl = page.url();
+        if (!capturedUrl) {
+            const downloadResponse = await responsePromise;
+
+            if (downloadResponse) {
+                capturedUrl = downloadResponse.url();
+            }
         }
 
-        return res.json({
-            success: true,
-            state: "done",
-            downloadUrl,
-            message: downloadUrl
-                ? "Download URL captured."
-                : download
-                    ? "Download initiated, but its URL was not exposed."
-                    : "The button was clicked; no URL was detected."
+        if (capturedUrl) {
+            lastDownloadUrl = capturedUrl;
+
+            return res.json({
+                success: true,
+                downloadUrl: capturedUrl,
+                source: "download-event"
+            });
+        }
+
+        res.status(404).json({
+            success: false,
+            error:
+                "The action was performed, but no direct download URL was exposed."
         });
 
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({
+            error: error.message
+        });
     } finally {
         busy = false;
     }
 });
 
-app.listen(PORT, "0.0.0.0", async () => {
-    console.log("Server listening on port " + PORT);
+// Current browser state
+app.get("/api/status", (req, res) => {
+    res.json({
+        state: currentState,
+        downloadUrl: lastDownloadUrl
+    });
+});
 
-    try {
-        await initialize();
-        console.log("Source page loaded.");
-    } catch (error) {
-        state = "error";
-        console.error("Browser initialization failed:", error.message);
-    }
+// Health check
+app.get("/health", (req, res) => {
+    res.json({ status: "ok" });
 });
 
 async function shutdown() {
-    if (browser) await browser.close().catch(() => {});
+    if (browser) {
+        await browser.close().catch(() => {});
+    }
+
     process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+app.listen(PORT, "0.0.0.0", () => {
+    console.log("Server listening on port " + PORT);
+});
