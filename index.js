@@ -4,27 +4,65 @@ const crypto = require("crypto");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Original URL
+// Hardcoded source URL
 const ORIGINAL_URL =
-  "https://downloadwella.com/u8yg9cg1fnti";
+    "https://downloadwella.com/u8yg9cg1fnti";
 
 app.use(express.json());
 
-// Store generated links in memory.
-// Links will be lost if the server restarts.
+// Generated links are stored in memory.
 const links = new Map();
 
-// Frontend
+// Fetch the original page.
+// Node.js 18+ provides the built-in fetch API.
+async function fetchOriginalPage() {
+    const controller = new AbortController();
+
+    const timeout = setTimeout(() => {
+        controller.abort();
+    }, 20000);
+
+    try {
+        const response = await fetch(ORIGINAL_URL, {
+            method: "GET",
+            redirect: "follow",
+            signal: controller.signal,
+            headers: {
+                "User-Agent": "Mozilla/5.0 (compatible; PageRenderer/1.0)",
+                "Accept": "text/html,application/xhtml+xml"
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(
+                `The source website returned HTTP ${response.status}`
+            );
+        }
+
+        const contentType = response.headers.get("content-type") || "";
+
+        if (!contentType.includes("text/html")) {
+            throw new Error(
+                "The source URL did not return an HTML page."
+            );
+        }
+
+        return await response.text();
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+// Homepage and Create Link interface
 app.get("/", (req, res) => {
-  res.type("html").send(`
+    res.type("html").send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport"
-          content="width=device-width, initial-scale=1.0">
-
-    <title>Create Download Link</title>
+          content="width=device-width, initial-scale=1">
+    <title>DownloadWella Link Creator</title>
 
     <style>
         * {
@@ -33,39 +71,37 @@ app.get("/", (req, res) => {
 
         body {
             margin: 0;
+            padding: 20px;
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-            padding: 20px;
             font-family: Arial, sans-serif;
-            background: #0b0b10;
             color: white;
+            background: #0b0b10;
         }
 
         .card {
             width: 100%;
-            max-width: 420px;
+            max-width: 440px;
             padding: 25px;
-            border-radius: 16px;
             background: #171720;
-            box-shadow: 0 10px 40px #0005;
+            border-radius: 15px;
         }
 
         h1 {
-            margin-top: 0;
             font-size: 24px;
         }
 
         p {
-            color: #b7b7c3;
+            color: #b8b8c5;
             line-height: 1.6;
         }
 
         button {
             width: 100%;
             padding: 14px;
-            margin-top: 15px;
+            margin-top: 12px;
             border: 0;
             border-radius: 8px;
             background: #ff5216;
@@ -77,67 +113,59 @@ app.get("/", (req, res) => {
 
         button:disabled {
             opacity: 0.6;
-            cursor: wait;
         }
 
         .result {
             display: none;
-            margin-top: 22px;
+            margin-top: 20px;
         }
 
         .result.show {
             display: block;
         }
 
-        .link-box {
+        .link {
             padding: 12px;
             overflow-wrap: anywhere;
-            border: 1px solid #363642;
-            border-radius: 8px;
             background: #0b0b10;
+            border: 1px solid #393943;
+            border-radius: 8px;
             color: #8bffb0;
-            line-height: 1.5;
         }
 
-        .status {
-            margin-top: 12px;
+        #status {
+            margin-top: 15px;
             font-size: 14px;
-            color: #b7b7c3;
-        }
-
-        .error {
-            color: #ff8585;
+            overflow-wrap: anywhere;
         }
     </style>
 </head>
 
 <body>
     <main class="card">
-        <h1>Download Link Creator</h1>
+        <h1>DownloadWella</h1>
 
         <p>
-            Generate a link for the configured source URL.
+            Create a link to the page served through this server.
         </p>
 
         <button id="createButton" onclick="createLink()">
             Create Link
         </button>
 
-        <div id="result" class="result">
+        <section id="result" class="result">
             <p>Your generated link:</p>
+            <div id="link" class="link"></div>
 
-            <div id="generatedLink" class="link-box"></div>
+            <button onclick="copyLink()">Copy Link</button>
+            <button onclick="openLink()">Open Page</button>
+        </section>
 
-            <button onclick="copyLink()">
-                Copy Link
-            </button>
-        </div>
-
-        <div id="status" class="status"></div>
+        <div id="status"></div>
     </main>
 
     <script>
-        let currentLink = "";
+        let generatedLink = "";
 
         async function createLink() {
             const button = document.getElementById("createButton");
@@ -145,9 +173,8 @@ app.get("/", (req, res) => {
             const result = document.getElementById("result");
 
             button.disabled = true;
-            button.textContent = "Creating...";
+            button.textContent = "Creating link...";
             status.textContent = "";
-            status.className = "status";
             result.classList.remove("show");
 
             try {
@@ -162,31 +189,27 @@ app.get("/", (req, res) => {
                 const data = await response.json();
 
                 if (!response.ok) {
-                    throw new Error(
-                        data.error || "Could not create the link."
-                    );
+                    throw new Error(data.error || "Failed to create link.");
                 }
 
-                currentLink = data.link;
+                generatedLink = data.link;
 
-                document.getElementById("generatedLink").textContent =
-                    currentLink;
+                document.getElementById("link").textContent =
+                    generatedLink;
 
                 result.classList.add("show");
                 status.textContent = "Link created successfully.";
 
-                // Automatically copy the link when possible.
                 try {
-                    await navigator.clipboard.writeText(currentLink);
+                    await navigator.clipboard.writeText(generatedLink);
                     status.textContent =
-                        "Link created and copied to your clipboard.";
+                        "Link created and copied to clipboard.";
                 } catch (_) {
-                    // The user can still press the Copy Link button.
+                    // Copy remains available through the button.
                 }
 
             } catch (error) {
                 status.textContent = error.message;
-                status.className = "status error";
             } finally {
                 button.disabled = false;
                 button.textContent = "Create Link";
@@ -197,26 +220,17 @@ app.get("/", (req, res) => {
             const status = document.getElementById("status");
 
             try {
-                await navigator.clipboard.writeText(currentLink);
-                status.textContent = "Link copied successfully.";
-                status.className = "status";
+                await navigator.clipboard.writeText(generatedLink);
+                status.textContent = "Link copied.";
             } catch (_) {
-                // Fallback for browsers without clipboard access.
-                const input = document.createElement("textarea");
-                input.value = currentLink;
-                document.body.appendChild(input);
-                input.select();
+                status.textContent =
+                    "Clipboard unavailable. Select and copy the link manually.";
+            }
+        }
 
-                const copied = document.execCommand("copy");
-                input.remove();
-
-                status.textContent = copied
-                    ? "Link copied successfully."
-                    : "Please copy the link manually.";
-
-                status.className = copied
-                    ? "status"
-                    : "status error";
+        function openLink() {
+            if (generatedLink) {
+                window.location.href = generatedLink;
             }
         }
     </script>
@@ -225,42 +239,81 @@ app.get("/", (req, res) => {
     `);
 });
 
-// Create a unique link
+// Create a unique page link.
 app.post("/api/create-link", (req, res) => {
-  const id = crypto.randomBytes(8).toString("hex");
-  
-  links.set(id, {
-    originalUrl: ORIGINAL_URL,
-    createdAt: new Date().toISOString()
-  });
-  
-  const link = `${req.protocol}://${req.get("host")}/r/${id}`;
-  
-  res.json({
-    success: true,
-    link
-  });
+    const id = crypto.randomBytes(12).toString("hex");
+
+    links.set(id, {
+        createdAt: Date.now()
+    });
+
+    // Use the configured public URL when deployed behind a proxy.
+    const baseUrl = process.env.PUBLIC_BASE_URL
+        ? process.env.PUBLIC_BASE_URL.replace(/\/+$/, "")
+        : `${req.protocol}://${req.get("host")}`;
+
+    res.json({
+        success: true,
+        link: `${baseUrl}/view/${id}`
+    });
 });
 
-// Redirect generated links to the original URL.
-// This does not proxy or render the original webpage.
-app.get("/r/:id", (req, res) => {
-  const record = links.get(req.params.id);
-  
-  if (!record) {
-    return res.status(404).send("Link not found or expired.");
-  }
-  
-  res.redirect(302, record.originalUrl);
+// Fetch and serve the source HTML instead of redirecting.
+app.get("/view/:id", async (req, res) => {
+    const record = links.get(req.params.id);
+
+    if (!record) {
+        return res.status(404).send("Link not found or expired.");
+    }
+
+    // Expire links after 24 hours.
+    if (Date.now() - record.createdAt > 24 * 60 * 60 * 1000) {
+        links.delete(req.params.id);
+        return res.status(410).send("This link has expired.");
+    }
+
+    try {
+        const html = await fetchOriginalPage();
+
+        res.status(200);
+        res.set("Content-Type", "text/html; charset=utf-8");
+        res.set("Cache-Control", "no-store");
+
+        // Do not strip or override the source site's security headers
+        // by pretending that this basic fetch is a complete proxy.
+        res.send(html);
+
+    } catch (error) {
+        console.error("Page fetch failed:", error.message);
+
+        res.status(502).type("html").send(`
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport"
+                      content="width=device-width, initial-scale=1">
+                <title>Page Loading Error</title>
+            </head>
+            <body style="font-family:Arial,sans-serif;padding:24px">
+                <h2>Unable to load the page</h2>
+                <p>
+                    The source website could not be retrieved.
+                    It may be unavailable or may require additional
+                    browser functionality.
+                </p>
+                <p>Please try again later.</p>
+            </body>
+            </html>
+        `);
+    }
 });
 
 // Health check
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok"
-  });
+    res.json({ status: "ok" });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
+    console.log(`Server listening on port ${PORT}`);
 });
