@@ -1,107 +1,266 @@
-const express = require('express');
-const axios = require('axios');
-const cheerio = require('cheerio');
-const cors = require('cors');
+const express = require("express");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Enable CORS so your frontend can communicate with this API
-app.use(cors());
+// Original URL
+const ORIGINAL_URL =
+  "https://downloadwella.com/u8yg9cg1fnti";
+
 app.use(express.json());
 
-// Base target configuration
-const BASE_URL = 'https://downloadwella.com';
+// Store generated links in memory.
+// Links will be lost if the server restarts.
+const links = new Map();
 
-// Endpoint to resolve the download link
-app.post('/api/resolve', async (req, res) => {
-  const { movieId } = req.body;
-  
-  // 1. Input Validation: Ensure the ID is provided and alphanumeric
-  if (!movieId || typeof movieId !== 'string') {
-    return res.status(400).json({ error: 'Movie ID is required.' });
-  }
-  
-  // Sanitize to allow only safe identifier characters (alphanumeric, dashes, underscores)
-  const sanitizedId = movieId.trim();
-  if (!/^[a-zA-Z0-9_-]+$/.test(sanitizedId)) {
-    return res.status(400).json({ error: 'Invalid Movie ID format.' });
-  }
-  
-  const targetUrl = `${BASE_URL}/${sanitizedId}`;
-  
-  try {
-    // 2. Fetch the target page HTML
-    const response = await axios.get(targetUrl, {
-      headers: {
-        // Providing a standard user-agent prevents basic blocking
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-      },
-      timeout: 10000 // 10-second timeout
-    });
-    
-    // 3. Parse the HTML using Cheerio
-    const $ = cheerio.load(response.data);
-    
-    let downloadUrl = null;
-    
-    /**
-     * CSS Selector Configuration:
-     * Replace the selector below with the actual tag, class, or attribute
-     * used on downloadwella.com for the direct link.
-     *
-     * Common patterns:
-     * - $('a#download_button').attr('href')
-     * - $('a[href*=".mp4"]').attr('href')
-     * - $('video source').attr('src')
-     */
-    
-    // Example: Looking for an anchor tag containing "download" in its href or text
-    $('a').each((i, el) => {
-      const href = $(el).attr('href');
-      const text = $(el).text().toLowerCase();
-      
-      if (href && (text.includes('download') || href.includes('.mp4') || href.includes('dl='))) {
-        downloadUrl = href;
-        return false; // Break the loop
-      }
-    });
-    
-    // Fallback: If not found, check video tags
-    if (!downloadUrl) {
-      downloadUrl = $('video source').attr('src') || $('video').attr('src');
-    }
-    
-    if (!downloadUrl) {
-      return res.status(404).json({
-        error: 'Could not locate a download link on the target page. The selector may need adjustment.'
-      });
-    }
-    
-    // 4. Send the extracted URL back to the client
-    return res.json({
-      success: true,
-      movieId: sanitizedId,
-      downloadUrl: downloadUrl
-    });
-    
-  } catch (error) {
-    if (error.response && error.response.status === 404) {
-      return res.status(404).json({ error: 'Target page not found.' });
-    }
-    
-    return res.status(500).json({
-      error: 'Failed to retrieve or process the target page.',
-      details: error.message
-    });
-  }
+// Frontend
+app.get("/", (req, res) => {
+  res.type("html").send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0">
+
+    <title>Create Download Link</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #0b0b10;
+            color: white;
+        }
+
+        .card {
+            width: 100%;
+            max-width: 420px;
+            padding: 25px;
+            border-radius: 16px;
+            background: #171720;
+            box-shadow: 0 10px 40px #0005;
+        }
+
+        h1 {
+            margin-top: 0;
+            font-size: 24px;
+        }
+
+        p {
+            color: #b7b7c3;
+            line-height: 1.6;
+        }
+
+        button {
+            width: 100%;
+            padding: 14px;
+            margin-top: 15px;
+            border: 0;
+            border-radius: 8px;
+            background: #ff5216;
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: wait;
+        }
+
+        .result {
+            display: none;
+            margin-top: 22px;
+        }
+
+        .result.show {
+            display: block;
+        }
+
+        .link-box {
+            padding: 12px;
+            overflow-wrap: anywhere;
+            border: 1px solid #363642;
+            border-radius: 8px;
+            background: #0b0b10;
+            color: #8bffb0;
+            line-height: 1.5;
+        }
+
+        .status {
+            margin-top: 12px;
+            font-size: 14px;
+            color: #b7b7c3;
+        }
+
+        .error {
+            color: #ff8585;
+        }
+    </style>
+</head>
+
+<body>
+    <main class="card">
+        <h1>Download Link Creator</h1>
+
+        <p>
+            Generate a link for the configured source URL.
+        </p>
+
+        <button id="createButton" onclick="createLink()">
+            Create Link
+        </button>
+
+        <div id="result" class="result">
+            <p>Your generated link:</p>
+
+            <div id="generatedLink" class="link-box"></div>
+
+            <button onclick="copyLink()">
+                Copy Link
+            </button>
+        </div>
+
+        <div id="status" class="status"></div>
+    </main>
+
+    <script>
+        let currentLink = "";
+
+        async function createLink() {
+            const button = document.getElementById("createButton");
+            const status = document.getElementById("status");
+            const result = document.getElementById("result");
+
+            button.disabled = true;
+            button.textContent = "Creating...";
+            status.textContent = "";
+            status.className = "status";
+            result.classList.remove("show");
+
+            try {
+                const response = await fetch("/api/create-link", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({})
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(
+                        data.error || "Could not create the link."
+                    );
+                }
+
+                currentLink = data.link;
+
+                document.getElementById("generatedLink").textContent =
+                    currentLink;
+
+                result.classList.add("show");
+                status.textContent = "Link created successfully.";
+
+                // Automatically copy the link when possible.
+                try {
+                    await navigator.clipboard.writeText(currentLink);
+                    status.textContent =
+                        "Link created and copied to your clipboard.";
+                } catch (_) {
+                    // The user can still press the Copy Link button.
+                }
+
+            } catch (error) {
+                status.textContent = error.message;
+                status.className = "status error";
+            } finally {
+                button.disabled = false;
+                button.textContent = "Create Link";
+            }
+        }
+
+        async function copyLink() {
+            const status = document.getElementById("status");
+
+            try {
+                await navigator.clipboard.writeText(currentLink);
+                status.textContent = "Link copied successfully.";
+                status.className = "status";
+            } catch (_) {
+                // Fallback for browsers without clipboard access.
+                const input = document.createElement("textarea");
+                input.value = currentLink;
+                document.body.appendChild(input);
+                input.select();
+
+                const copied = document.execCommand("copy");
+                input.remove();
+
+                status.textContent = copied
+                    ? "Link copied successfully."
+                    : "Please copy the link manually.";
+
+                status.className = copied
+                    ? "status"
+                    : "status error";
+            }
+        }
+    </script>
+</body>
+</html>
+    `);
 });
 
-// Health check route for Render
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+// Create a unique link
+app.post("/api/create-link", (req, res) => {
+  const id = crypto.randomBytes(8).toString("hex");
+  
+  links.set(id, {
+    originalUrl: ORIGINAL_URL,
+    createdAt: new Date().toISOString()
+  });
+  
+  const link = `${req.protocol}://${req.get("host")}/r/${id}`;
+  
+  res.json({
+    success: true,
+    link
+  });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+// Redirect generated links to the original URL.
+// This does not proxy or render the original webpage.
+app.get("/r/:id", (req, res) => {
+  const record = links.get(req.params.id);
+  
+  if (!record) {
+    return res.status(404).send("Link not found or expired.");
+  }
+  
+  res.redirect(302, record.originalUrl);
+});
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok"
+  });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
 });
