@@ -1,508 +1,312 @@
 const express = require("express");
-const { chromium } = require("playwright");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const SOURCE_URL =
+// Hardcoded source URL
+const ORIGINAL_URL =
     "https://downloadwella.com/u8yg9cg1fnti";
 
 app.use(express.json());
 
-let browser;
-let context;
-let page;
-let busy = false;
-let currentState = "idle";
-let lastDownloadUrl = null;
+// Generated links are stored in memory.
+const links = new Map();
 
-function setState(state) {
-    currentState = state;
-}
+// Fetch the original page.
+// Node.js 18+ provides the built-in fetch API.
+async function fetchOriginalPage() {
+    const controller = new AbortController();
 
-async function initializeBrowser() {
-    browser = await chromium.launch({
-        headless: true
-    });
+    const timeout = setTimeout(() => {
+        controller.abort();
+    }, 20000);
 
-    context = await browser.newContext({
-        acceptDownloads: true
-    });
+    try {
+        const response = await fetch(ORIGINAL_URL, {
+            method: "GET",
+            redirect: "follow",
+            signal: controller.signal,
+            headers: {
+                "User-Agent": "Mozilla/5.0 (compatible; PageRenderer/1.0)",
+                "Accept": "text/html,application/xhtml+xml"
+            }
+        });
 
-    page = await context.newPage();
-
-    page.setDefaultTimeout(20000);
-
-    await page.goto(SOURCE_URL, {
-        waitUntil: "domcontentloaded",
-        timeout: 45000
-    });
-
-    console.log("Browser opened:", SOURCE_URL);
-}
-
-function findButton(text) {
-    return page.getByText(text, {
-        exact: false
-    }).filter({
-        visible: true
-    }).first();
-}
-
-async function findVisibleControl(pattern) {
-    const candidates = page.locator(
-        "a, button, input[type='button'], input[type='submit'], [role='button']"
-    );
-
-    const count = await candidates.count();
-
-    for (let i = 0; i < count; i++) {
-        const element = candidates.nth(i);
-
-        if (!(await element.isVisible())) {
-            continue;
+        if (!response.ok) {
+            throw new Error(
+                `The source website returned HTTP ${response.status}`
+            );
         }
 
-        const label = (
-            await element.innerText().catch(() => "")
-        ).trim();
+        const contentType = response.headers.get("content-type") || "";
 
-        const value = await element.getAttribute("value")
-            .catch(() => "");
-
-        const text = label || value || "";
-
-        if (pattern.test(text)) {
-            return element;
+        if (!contentType.includes("text/html")) {
+            throw new Error(
+                "The source URL did not return an HTML page."
+            );
         }
-    }
 
-    return null;
+        return await response.text();
+    } finally {
+        clearTimeout(timeout);
+    }
 }
 
-async function getLinkFromControl(control) {
-    if (!control) {
-        return null;
-    }
-
-    const tag = await control.evaluate(
-        element => element.tagName.toLowerCase()
-    );
-
-    if (tag === "a") {
-        const href = await control.getAttribute("href");
-
-        if (href) {
-            return new URL(href, page.url()).href;
-        }
-    }
-
-    const nestedLink = control.locator("a[href]").first();
-
-    if (await nestedLink.count()) {
-        const href = await nestedLink.getAttribute("href");
-
-        if (href) {
-            return new URL(href, page.url()).href;
-        }
-    }
-
-    return null;
-}
-
-// Frontend
+// Homepage and Create Link interface
 app.get("/", (req, res) => {
     res.type("html").send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1">
+    <title>DownloadWella Link Creator</title>
 
-<title>Download Link Controller</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
 
-<style>
-* {
-    box-sizing: border-box;
-}
+        body {
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: Arial, sans-serif;
+            color: white;
+            background: #0b0b10;
+        }
 
-body {
-    margin: 0;
-    min-height: 100vh;
-    display: grid;
-    place-items: center;
-    padding: 20px;
-    background: #0b0b10;
-    color: white;
-    font-family: Arial, sans-serif;
-}
+        .card {
+            width: 100%;
+            max-width: 440px;
+            padding: 25px;
+            background: #171720;
+            border-radius: 15px;
+        }
 
-.card {
-    width: 100%;
-    max-width: 440px;
-    padding: 24px;
-    border-radius: 16px;
-    background: #191921;
-}
+        h1 {
+            font-size: 24px;
+        }
 
-h1 {
-    font-size: 23px;
-}
+        p {
+            color: #b8b8c5;
+            line-height: 1.6;
+        }
 
-p {
-    color: #b6b6c2;
-    line-height: 1.6;
-}
+        button {
+            width: 100%;
+            padding: 14px;
+            margin-top: 12px;
+            border: 0;
+            border-radius: 8px;
+            background: #ff5216;
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+        }
 
-button {
-    width: 100%;
-    padding: 14px;
-    margin-top: 12px;
-    border: 0;
-    border-radius: 8px;
-    background: #ff5216;
-    color: white;
-    font-size: 15px;
-    font-weight: bold;
-    cursor: pointer;
-}
+        button:disabled {
+            opacity: 0.6;
+        }
 
-button:disabled {
-    opacity: 0.5;
-}
+        .result {
+            display: none;
+            margin-top: 20px;
+        }
 
-#startButton, #result {
-    display: none;
-}
+        .result.show {
+            display: block;
+        }
 
-#startButton.visible, #result.visible {
-    display: block;
-}
+        .link {
+            padding: 12px;
+            overflow-wrap: anywhere;
+            background: #0b0b10;
+            border: 1px solid #393943;
+            border-radius: 8px;
+            color: #8bffb0;
+        }
 
-.output {
-    overflow-wrap: anywhere;
-    padding: 12px;
-    border: 1px solid #40404b;
-    border-radius: 8px;
-    background: #0b0b10;
-    color: #8bffb0;
-}
-
-#status {
-    margin-top: 16px;
-    font-size: 14px;
-    overflow-wrap: anywhere;
-}
-</style>
+        #status {
+            margin-top: 15px;
+            font-size: 14px;
+            overflow-wrap: anywhere;
+        }
+    </style>
 </head>
 
 <body>
-<main class="card">
-    <h1>Download Link Controller</h1>
+    <main class="card">
+        <h1>DownloadWella</h1>
 
-    <p>
-        Control the browser session and retrieve the
-        resulting download URL.
-    </p>
+        <p>
+            Create a link to the page served through this server.
+        </p>
 
-    <button id="createButton" onclick="createDownload()">
-        Create Download
-    </button>
+        <button id="createButton" onclick="createLink()">
+            Create Link
+        </button>
 
-    <button id="startButton" onclick="startDownload()">
-        Start Download
-    </button>
+        <section id="result" class="result">
+            <p>Your generated link:</p>
+            <div id="link" class="link"></div>
 
-    <section id="result">
-        <p>Download URL:</p>
-        <div class="output" id="downloadUrl"></div>
+            <button onclick="copyLink()">Copy Link</button>
+            <button onclick="openLink()">Open Page</button>
+        </section>
 
-        <button onclick="copyUrl()">Copy Download URL</button>
-        <button onclick="openUrl()">Open Download URL</button>
-    </section>
+        <div id="status"></div>
+    </main>
 
-    <div id="status">Ready.</div>
-</main>
+    <script>
+        let generatedLink = "";
 
-<script>
-const statusElement = document.getElementById("status");
-const createButton = document.getElementById("createButton");
-const startButton = document.getElementById("startButton");
-const resultElement = document.getElementById("result");
+        async function createLink() {
+            const button = document.getElementById("createButton");
+            const status = document.getElementById("status");
+            const result = document.getElementById("result");
 
-let downloadUrl = "";
+            button.disabled = true;
+            button.textContent = "Creating link...";
+            status.textContent = "";
+            result.classList.remove("show");
 
-async function request(path) {
-    const response = await fetch(path, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify({})
-    });
+            try {
+                const response = await fetch("/api/create-link", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({})
+                });
 
-    const data = await response.json();
+                const data = await response.json();
 
-    if (!response.ok) {
-        throw new Error(data.error || "Request failed.");
-    }
+                if (!response.ok) {
+                    throw new Error(data.error || "Failed to create link.");
+                }
 
-    return data;
-}
+                generatedLink = data.link;
 
-async function createDownload() {
-    createButton.disabled = true;
-    statusElement.textContent =
-        "Server is clicking Create Download...";
+                document.getElementById("link").textContent =
+                    generatedLink;
 
-    try {
-        const data = await request("/api/create-download");
+                result.classList.add("show");
+                status.textContent = "Link created successfully.";
 
-        statusElement.textContent = data.message;
+                try {
+                    await navigator.clipboard.writeText(generatedLink);
+                    status.textContent =
+                        "Link created and copied to clipboard.";
+                } catch (_) {
+                    // Copy remains available through the button.
+                }
 
-        if (data.state === "start-ready") {
-            startButton.classList.add("visible");
+            } catch (error) {
+                status.textContent = error.message;
+            } finally {
+                button.disabled = false;
+                button.textContent = "Create Link";
+            }
         }
-    } catch (error) {
-        statusElement.textContent = error.message;
-    } finally {
-        createButton.disabled = false;
-    }
-}
 
-async function startDownload() {
-    startButton.disabled = true;
-    statusElement.textContent =
-        "Server is processing Start Download...";
+        async function copyLink() {
+            const status = document.getElementById("status");
 
-    try {
-        const data = await request("/api/start-download");
-
-        if (data.downloadUrl) {
-            downloadUrl = data.downloadUrl;
-
-            document.getElementById("downloadUrl").textContent =
-                downloadUrl;
-
-            resultElement.classList.add("visible");
-
-            statusElement.textContent =
-                "Download URL retrieved.";
-        } else {
-            statusElement.textContent =
-                data.message || "No download URL was detected.";
+            try {
+                await navigator.clipboard.writeText(generatedLink);
+                status.textContent = "Link copied.";
+            } catch (_) {
+                status.textContent =
+                    "Clipboard unavailable. Select and copy the link manually.";
+            }
         }
-    } catch (error) {
-        statusElement.textContent = error.message;
-    } finally {
-        startButton.disabled = false;
-    }
-}
 
-async function copyUrl() {
-    if (!downloadUrl) return;
-
-    try {
-        await navigator.clipboard.writeText(downloadUrl);
-        statusElement.textContent = "URL copied.";
-    } catch (_) {
-        statusElement.textContent =
-            "Clipboard unavailable. Copy the displayed URL manually.";
-    }
-}
-
-function openUrl() {
-    if (downloadUrl) {
-        window.open(downloadUrl, "_blank");
-    }
-}
-</script>
+        function openLink() {
+            if (generatedLink) {
+                window.location.href = generatedLink;
+            }
+        }
+    </script>
 </body>
 </html>
     `);
 });
 
-// Step 1: Click Create download link.
-app.post("/api/create-download", async (req, res) => {
-    if (busy) {
-        return res.status(409).json({
-            error: "Another browser action is in progress."
-        });
-    }
+// Create a unique page link.
+app.post("/api/create-link", (req, res) => {
+    const id = crypto.randomBytes(12).toString("hex");
 
-    busy = true;
-
-    try {
-        if (!page || page.isClosed()) {
-            await initializeBrowser();
-        }
-
-        const control = await findVisibleControl(
-            /create\s+download\s+link/i
-        );
-
-        if (!control) {
-            return res.status(404).json({
-                error: "Create download link button was not found."
-            });
-        }
-
-        await control.click();
-
-        // Wait for the page to expose the next action.
-        await page.waitForFunction(() => {
-            const elements = Array.from(
-                document.querySelectorAll(
-                    "a, button, input, [role='button']"
-                )
-            );
-
-            return elements.some(element => {
-                const text = (
-                    element.innerText ||
-                    element.value ||
-                    ""
-                ).trim();
-
-                return /start\s+download/i.test(text) &&
-                    element.getClientRects().length > 0;
-            });
-        }, { timeout: 20000 }).catch(() => {});
-
-        const startControl = await findVisibleControl(
-            /start\s+download/i
-        );
-
-        if (!startControl) {
-            setState("create-clicked");
-
-            return res.json({
-                success: true,
-                state: currentState,
-                message:
-                    "Create action completed, but Start Download was not detected."
-            });
-        }
-
-        setState("start-ready");
-
-        res.json({
-            success: true,
-            state: currentState,
-            message: "Start Download is ready."
-        });
-
-    } catch (error) {
-        res.status(500).json({
-            error: error.message
-        });
-    } finally {
-        busy = false;
-    }
-});
-
-// Step 2: Click Start Download and capture a download URL.
-app.post("/api/start-download", async (req, res) => {
-    if (busy) {
-        return res.status(409).json({
-            error: "Another browser action is in progress."
-        });
-    }
-
-    busy = true;
-
-    try {
-        if (!page || page.isClosed()) {
-            throw new Error("Browser session is unavailable.");
-        }
-
-        const control = await findVisibleControl(
-            /start\s+download/i
-        );
-
-        if (!control) {
-            throw new Error(
-                "Start Download button was not found."
-            );
-        }
-
-        let capturedUrl = await getLinkFromControl(control);
-
-        // If the control contains an actual link, return it.
-        if (capturedUrl) {
-            lastDownloadUrl = capturedUrl;
-
-            return res.json({
-                success: true,
-                downloadUrl: capturedUrl,
-                source: "link-element"
-            });
-        }
-
-        // Otherwise, observe the download event while clicking.
-        const downloadPromise = page.waitForEvent("download", {
-            timeout: 20000
-        }).catch(() => null);
-
-        const responsePromise = page.waitForResponse(response => {
-            const headers = response.headers();
-
-            return (
-                headers["content-disposition"] &&
-                /attachment/i.test(headers["content-disposition"])
-            );
-        }, {
-            timeout: 20000
-        }).catch(() => null);
-
-        await control.click();
-
-        const download = await downloadPromise;
-
-        if (download) {
-            capturedUrl = download.url();
-        }
-
-        if (!capturedUrl) {
-            const downloadResponse = await responsePromise;
-
-            if (downloadResponse) {
-                capturedUrl = downloadResponse.url();
-            }
-        }
-
-        if (capturedUrl) {
-            lastDownloadUrl = capturedUrl;
-
-            return res.json({
-                success: true,
-                downloadUrl: capturedUrl,
-                source: "download-event"
-            });
-        }
-
-        res.status(404).json({
-            success: false,
-            error:
-                "The action was performed, but no direct download URL was exposed."
-        });
-
-    } catch (error) {
-        res.status(500).json({
-            error: error.message
-        });
-    } finally {
-        busy = false;
-    }
-});
-
-// Current browser state
-app.get("/api/status", (req, res) => {
-    res.json({
-        state: currentState,
-        downloadUrl: lastDownloadUrl
+    links.set(id, {
+        createdAt: Date.now()
     });
+
+    // Use the configured public URL when deployed behind a proxy.
+    const baseUrl = process.env.PUBLIC_BASE_URL
+        ? process.env.PUBLIC_BASE_URL.replace(/\/+$/, "")
+        : `${req.protocol}://${req.get("host")}`;
+
+    res.json({
+        success: true,
+        link: `${baseUrl}/view/${id}`
+    });
+});
+
+// Fetch and serve the source HTML instead of redirecting.
+app.get("/view/:id", async (req, res) => {
+    const record = links.get(req.params.id);
+
+    if (!record) {
+        return res.status(404).send("Link not found or expired.");
+    }
+
+    // Expire links after 24 hours.
+    if (Date.now() - record.createdAt > 24 * 60 * 60 * 1000) {
+        links.delete(req.params.id);
+        return res.status(410).send("This link has expired.");
+    }
+
+    try {
+        const html = await fetchOriginalPage();
+
+        res.status(200);
+        res.set("Content-Type", "text/html; charset=utf-8");
+        res.set("Cache-Control", "no-store");
+
+        // Do not strip or override the source site's security headers
+        // by pretending that this basic fetch is a complete proxy.
+        res.send(html);
+
+    } catch (error) {
+        console.error("Page fetch failed:", error.message);
+
+        res.status(502).type("html").send(`
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport"
+                      content="width=device-width, initial-scale=1">
+                <title>Page Loading Error</title>
+            </head>
+            <body style="font-family:Arial,sans-serif;padding:24px">
+                <h2>Unable to load the page</h2>
+                <p>
+                    The source website could not be retrieved.
+                    It may be unavailable or may require additional
+                    browser functionality.
+                </p>
+                <p>Please try again later.</p>
+            </body>
+            </html>
+        `);
+    }
 });
 
 // Health check
@@ -510,17 +314,6 @@ app.get("/health", (req, res) => {
     res.json({ status: "ok" });
 });
 
-async function shutdown() {
-    if (browser) {
-        await browser.close().catch(() => {});
-    }
-
-    process.exit(0);
-}
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-
 app.listen(PORT, "0.0.0.0", () => {
-    console.log("Server listening on port " + PORT);
+    console.log(`Server listening on port ${PORT}`);
 });
