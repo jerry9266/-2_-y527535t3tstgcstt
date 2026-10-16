@@ -1,10 +1,11 @@
 {
   "name": "downloadwella-link-server",
   "version": "1.0.0",
-  "description": "Server for generating DownloadWella links",
+  "description": "DownloadWella browser automation server",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "playwright install chromium"
   },
   "dependencies": {
     "express": "^5.1.0",
