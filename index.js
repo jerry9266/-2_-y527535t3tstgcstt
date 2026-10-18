@@ -2,66 +2,58 @@ const express = require('express');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const cors = require('cors');
+const admin = require('firebase-admin');
+const serviceAccount = require('./serviceAccountKey.json');
+
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 const app = express();
-const port = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
 cloudinary.config({
-    cloud_name: 'qgtma8wv',
-    api_key: '226171487848885',
-    api_secret: 'MSJO8EKk5EnrCMp4hgQouDMl3bw'
+  cloud_name: 'qgtma8wv',
+  api_key: '226171487848885',
+  api_secret: 'MSJO8EKk5EnrCMp4hgQouDMl3bw'
 });
 
-const storage = multer.memoryStorage();
-const upload = multer({ storage });
+const upload = multer({ storage: multer.memoryStorage() });
 
-// POST: Upload with publisher_name and description
-app.post('/upload', upload.single('image'), (req, res) => {
-    const { publisher_name, description } = req.body;
-    
-    if (!req.file) return res.status(400).json({ error: 'Image is required' });
-    
-    const uploadStream = cloudinary.uploader.upload_stream(
-        {
-            folder: 'publisher_images',
-            context: {
-                publisher_name: publisher_name || 'Anonymous',
-                description: description || 'No description'
-            }
-        },
-        (error, result) => {
-            if (error) return res.status(500).json({ error: 'Upload failed' });
-            res.status(200).json({ message: 'Success', imageUrl: result.secure_url });
-        }
-    );
-    uploadStream.end(req.file.buffer);
-});
+// Middleware to verify Firebase token
+const verifyAuth = async (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.user = decodedToken; // contains email
+    next();
+  } catch (e) { res.status(403).json({ error: 'Invalid Token' }); }
+};
 
-// GET: Retrieve all images with metadata
-app.get('/images', async (req, res) => {
-    try {
-        const result = await cloudinary.api.resources({
-            type: 'upload',
-            prefix: 'publisher_images/',
-            context: true,
-            max_results: 50
-        });
-        
-        const images = result.resources.map(img => ({
-            id: img.public_id,
-            imageUrl: img.secure_url,
-            publisherName: img.context?.custom?.publisher_name || 'Anonymous',
-            description: img.context?.custom?.description || 'No description'
-        }));
-        
-        res.status(200).json({ images });
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to fetch' });
+// Upload endpoint
+app.post('/upload', verifyAuth, upload.single('image'), (req, res) => {
+  const { description } = req.body;
+  // Automatically extract username from authenticated email
+  const publisher_name = req.user.email.split('@')[0].replace('.', '_');
+
+  const uploadStream = cloudinary.uploader.upload_stream(
+    { folder: 'publisher_images', context: { publisher_name, description } },
+    (error, result) => {
+      if (error) return res.status(500).json({ error: 'Upload failed' });
+      res.status(200).json({ success: true, imageUrl: result.secure_url });
     }
+  );
+  uploadStream.end(req.file.buffer);
 });
 
-app.listen(port, () => console.log(`Server running on port ${port}`));
+// GET images
+app.get('/images', async (req, res) => {
+  const result = await cloudinary.api.resources({ type: 'upload', prefix: 'publisher_images/', context: true });
+  res.json({ images: result.resources.map(img => ({
+    imageUrl: img.secure_url,
+    publisherName: img.context?.custom?.publisher_name || 'Anonymous',
+    description: img.context?.custom?.description || ''
+  }))});
+});
+
+app.listen(3000, () => console.log('Server running'));
